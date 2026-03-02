@@ -5,7 +5,7 @@ import {
   GROUP_NAME,
   RESULTS_STREAM,
 } from "./config";
-import fs, { open } from "fs";
+import fs from "fs";
 import type {
   IEventData,
   IOrder,
@@ -53,36 +53,48 @@ const createConsumerGroup = async () => {
   }
 };
 
-const saveSnapshot = () => {
+const saveSnapshot = async () => {
+  const tmpPath = "./snapshot.tmp.json";
+  const finalPath = "./snapshot.json";
+  const backupPath = "./snapshot.backup.json";
+
   const currState = {
     timestamp: Date.now(),
-    openOrders: openOrders,
-    balances: balances,
+    openOrders,
+    balances,
     price: prices,
     lastStreamId,
   };
 
-  fs.writeFile("./snapshot.json", JSON.stringify(currState), (err) => {
-    if (err) {
-      console.error(err.message);
-    }
-  });
-};
-
-const restoreSnapshot = () => {
   try {
-    if (fs.existsSync("./snapshot.json")) {
-      const data = fs.readFileSync("./snapshot.json", "utf-8");
+    await fs.promises.writeFile(tmpPath, JSON.stringify(currState));
+
+    if (fs.existsSync(finalPath)) {
+      await fs.promises.copyFile(finalPath, backupPath);
+    }
+
+    await fs.promises.rename(tmpPath, finalPath);
+  } catch (err) {
+    console.error("Snapshot save failed:", err);
+  }
+};
+const restoreSnapshot = () => {
+  for (const path of ["./snapshot.json", "./snapshot.backup.json"]) {
+    try {
+      if (!fs.existsSync(path)) continue;
+      const data = fs.readFileSync(path, "utf-8");
       const rawData = JSON.parse(data);
       openOrders = rawData.openOrders || {};
       balances = rawData.balances || {};
       prices = rawData.price || {};
       lastStreamId = rawData.lastStreamId || "0";
-      console.log("Snapshot restored at streamId:", lastStreamId);
+      console.log(`Snapshot restored from ${path} at streamId:`, lastStreamId);
+      return;
+    } catch (err) {
+      console.error(`Failed to restore from ${path}:`, err);
     }
-  } catch (error) {
-    console.error("Error while restoring snapshot: ", error);
   }
+  console.warn("No valid snapshot found, starting fresh");
 };
 
 const autoCloseOrder = async (order: IOrder) => {
@@ -157,9 +169,11 @@ const handleCalculatePNL = async (order: IOrder, currentPrices: IPriceData) => {
 
   const orderMargin = order.margin / 10 ** usdtDecimals;
 
-  const equity = orderMargin + pnl;
+  const positionSize = orderMargin * order.leverage;
+  const unrealizedLoss = -pnl;
+  const marginUsedPercent = unrealizedLoss / positionSize;
 
-  if (equity <= orderMargin * 0.1) {
+  if (marginUsedPercent >= 0.9) {
     console.log("Order is closing due to low margin (liquidation)");
 
     await autoCloseOrder(order);
@@ -167,15 +181,19 @@ const handleCalculatePNL = async (order: IOrder, currentPrices: IPriceData) => {
 };
 
 const handlePriceUpdate = async (latestPrices: Record<string, IPriceData>) => {
-  const pnlPromises = [];
+  const pnlPromises = Object.values(openOrders)
+    .flat()
+    .map((order) => {
+      return handleCalculatePNL(order, latestPrices[order.asset]!);
+    });
 
-  for (const user in openOrders) {
-    for (const order of openOrders[user]!) {
-      pnlPromises.push(handleCalculatePNL(order, latestPrices[order.asset]!));
-    }
+  const results = await Promise.allSettled(pnlPromises);
+
+  const failures = results.filter((result) => result.status === "rejected");
+
+  if (failures.length > 0) {
+    console.error("Failed to process PNL for " + failures.length + " orders");
   }
-
-  await Promise.allSettled(pnlPromises);
 };
 
 const processPlaceOrder = async (event: IEventData) => {
@@ -419,19 +437,23 @@ const processEvents = async (events: IEventData[]) => {
         break;
       }
       case "PRICE_UPDATE": {
-        if (event.data) {
-          Object.keys(event.data).forEach(
-            (val: string) =>
-              (prices[val] = {
-                decimal: event.data[val]!.decimal,
-                bid: event.data[val]!.bid,
-                ask: event.data[val]!.ask,
-              }),
-          );
+        try {
+          if (event.data) {
+            Object.keys(event.data).forEach(
+              (val: string) =>
+                (prices[val] = {
+                  decimal: event.data[val]!.decimal,
+                  bid: event.data[val]!.bid,
+                  ask: event.data[val]!.ask,
+                }),
+            );
+          }
+          await handlePriceUpdate(prices);
+          await redisclient.xack(ENGINE_STREAM, GROUP_NAME, event.streamId);
+          lastStreamId = event.streamId;
+        } catch (error) {
+          console.error("Error while processing price update: ", error);
         }
-        await handlePriceUpdate(prices);
-        await redisclient.xack(ENGINE_STREAM, GROUP_NAME, event.streamId);
-        lastStreamId = event.streamId;
         break;
       }
       default: {
